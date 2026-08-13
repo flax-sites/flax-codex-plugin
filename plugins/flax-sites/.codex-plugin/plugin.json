@@ -35,9 +35,9 @@
     "logo": "./assets/icon.png",
     "logoDark": "./assets/icon.png",
     "defaultPrompt": [
-      "Connect to my Flax site and show its current model.",
-      "Review my Flax site and suggest focused improvements.",
-      "Validate this Flax site update and create a preview draft."
+      "Help me start selling products on my Flax site.",
+      "Run an SEO programme for my site and give me regular updates.",
+      "Review my site, suggest improvements, and check for issues."
     ]
   },
   "mcpServers": "./.mcp.json"
