@@ -1,0 +1,44 @@
+{
+  "name": "flax-sites",
+  "version": "0.1.0",
+  "description": "Connect Codex to Flax Sites with browser OAuth and site-scoped MCP tools.",
+  "author": {
+    "name": "Flax"
+  },
+  "homepage": "https://flaxsites.com/docs/agents",
+  "repository": "https://github.com/flax-sites/flax-codex-plugin",
+  "keywords": [
+    "flax",
+    "websites",
+    "mcp",
+    "oauth",
+    "site-management"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Flax Sites",
+    "shortDescription": "Connect Codex to your Flax website.",
+    "longDescription": "Use a browser-based Flax OAuth connection to inspect one named site and prepare owner-approved drafts through its site-scoped MCP server.",
+    "developerName": "Flax",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "MCP",
+      "OAuth",
+      "Write"
+    ],
+    "websiteURL": "https://flaxsites.com",
+    "privacyPolicyURL": "https://flaxsites.com/legal/privacy-policy/",
+    "termsOfServiceURL": "https://flaxsites.com/legal/tos/",
+    "brandColor": "#F9781F",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/icon.png",
+    "logoDark": "./assets/icon.png",
+    "defaultPrompt": [
+      "Connect to my Flax site and show its current model.",
+      "Review my Flax site and suggest focused improvements.",
+      "Validate this Flax site update and create a preview draft."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
