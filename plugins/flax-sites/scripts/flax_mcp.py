@@ -31,6 +31,7 @@ TOKEN_SERVICE = "flax-sites-codex"
 TOKEN_ACCOUNT = "default"
 TOKEN_FILE = Path.home() / ".config" / "flax-sites" / "tokens.json"
 CALLBACK_TIMEOUT_SECONDS = 300
+KEYCHAIN_TIMEOUT_SECONDS = 5
 BLOCKED_REMOTE_TOOLS = {"flax_publish_change"}
 
 
@@ -49,6 +50,21 @@ def normalize_origin(site_url: str) -> str:
     if parsed.username or parsed.password:
         raise BridgeError("Site URLs must not contain credentials")
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def merge_query_params(url: str, params: dict[str, str]) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    merged = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    merged.update(params)
+    return urllib.parse.urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urllib.parse.urlencode(merged),
+            parsed.fragment,
+        )
+    )
 
 
 def json_request(
@@ -138,6 +154,20 @@ def pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
+def as_tool_result(value: Any) -> dict[str, Any]:
+    """Return a valid MCP CallToolResult for local and proxied tool values."""
+    if isinstance(value, dict) and isinstance(value.get("content"), list):
+        return value
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(value, separators=(",", ":"), ensure_ascii=False),
+            }
+        ]
+    }
+
+
 class TokenStore:
     """Prefer OS keychains and use a mode-600 file as a portable fallback."""
 
@@ -145,26 +175,38 @@ class TokenStore:
         self.path = path
 
     def _keychain_available(self) -> bool:
-        return self.path == TOKEN_FILE and sys.platform == "darwin" and subprocess.run(
-            ["which", "security"], capture_output=True, text=True
-        ).returncode == 0
+        if self.path != TOKEN_FILE or sys.platform != "darwin":
+            return False
+        try:
+            return subprocess.run(
+                ["which", "security"],
+                capture_output=True,
+                text=True,
+                timeout=KEYCHAIN_TIMEOUT_SECONDS,
+            ).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
 
     def load(self) -> dict[str, Any] | None:
         if self._keychain_available():
-            result = subprocess.run(
-                [
-                    "security",
-                    "find-generic-password",
-                    "-s",
-                    TOKEN_SERVICE,
-                    "-a",
-                    TOKEN_ACCOUNT,
-                    "-w",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0 and result.stdout.strip():
+            try:
+                result = subprocess.run(
+                    [
+                        "security",
+                        "find-generic-password",
+                        "-s",
+                        TOKEN_SERVICE,
+                        "-a",
+                        TOKEN_ACCOUNT,
+                        "-w",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=KEYCHAIN_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                result = None
+            if result and result.returncode == 0 and result.stdout.strip():
                 try:
                     return json.loads(result.stdout)
                 except json.JSONDecodeError:
@@ -179,22 +221,26 @@ class TokenStore:
     def save(self, value: dict[str, Any]) -> None:
         encoded = json.dumps(value, separators=(",", ":"))
         if self._keychain_available():
-            result = subprocess.run(
-                [
-                    "security",
-                    "add-generic-password",
-                    "-U",
-                    "-s",
-                    TOKEN_SERVICE,
-                    "-a",
-                    TOKEN_ACCOUNT,
-                    "-w",
-                ],
-                input=encoded,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
+            try:
+                result = subprocess.run(
+                    [
+                        "security",
+                        "add-generic-password",
+                        "-U",
+                        "-s",
+                        TOKEN_SERVICE,
+                        "-a",
+                        TOKEN_ACCOUNT,
+                        "-w",
+                    ],
+                    input=encoded,
+                    capture_output=True,
+                    text=True,
+                    timeout=KEYCHAIN_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                result = None
+            if result and result.returncode == 0:
                 return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(value, indent=2) + "\n")
@@ -202,17 +248,21 @@ class TokenStore:
 
     def clear(self) -> None:
         if self._keychain_available():
-            subprocess.run(
-                [
-                    "security",
-                    "delete-generic-password",
-                    "-s",
-                    TOKEN_SERVICE,
-                    "-a",
-                    TOKEN_ACCOUNT,
-                ],
-                capture_output=True,
-            )
+            try:
+                subprocess.run(
+                    [
+                        "security",
+                        "delete-generic-password",
+                        "-s",
+                        TOKEN_SERVICE,
+                        "-a",
+                        TOKEN_ACCOUNT,
+                    ],
+                    capture_output=True,
+                    timeout=KEYCHAIN_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                pass
         try:
             self.path.unlink()
         except FileNotFoundError:
@@ -259,6 +309,17 @@ class FlaxBridge:
 
     def connect(self, site_url: str) -> dict[str, Any]:
         origin = normalize_origin(site_url)
+        existing = self.store.load() or {}
+        same_site = existing.get("site_url") == origin
+        has_current_access = bool(existing.get("access_token")) and existing.get(
+            "expires_at", 0
+        ) >= time.time() + 30
+        can_refresh = bool(existing.get("refresh_token"))
+        if same_site and existing.get("mcp_url") and (has_current_access or can_refresh):
+            return {
+                "siteUrl": origin,
+                "message": "Flax is already connected for this site.",
+            }
         discovery_url = f"{origin}/.well-known/mcp.json"
         status, _, discovery = json_request(discovery_url, follow_redirects=False)
         if status != 200 or not isinstance(discovery, dict):
@@ -322,7 +383,9 @@ class FlaxBridge:
                 "code_challenge_method": "S256",
                 "resource": mcp_url,
             }
-            authorization_url = authorization_metadata["authorization_endpoint"] + "?" + urllib.parse.urlencode(params)
+            authorization_url = merge_query_params(
+                authorization_metadata["authorization_endpoint"], params
+            )
             eprint("Opening Flax authorization in your browser…")
             if not webbrowser.open(authorization_url):
                 eprint(f"Open this one-time URL in your browser: {authorization_url}")
@@ -408,6 +471,8 @@ class FlaxBridge:
             )
         if status < 200 or status >= 300:
             raise BridgeError(f"Flax MCP request failed with HTTP {status}")
+        if not isinstance(body, dict):
+            raise BridgeError("Flax MCP returned an unexpected response type")
         if response_headers.get("Mcp-Session-Id"):
             self.session_id = response_headers["Mcp-Session-Id"]
         return body
@@ -431,6 +496,109 @@ LOCAL_TOOLS = [
     },
 ]
 
+# Codex snapshots MCP tool names when a task starts. Declare stable proxy tools
+# before OAuth so the same task can use them immediately after flax_connect.
+# Authenticated tools/list responses replace these fallback definitions below.
+PROXIED_REMOTE_TOOLS = [
+    {
+        "name": "flax_list_sites",
+        "description": "List the Flax site granted to this site-scoped connection.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "flax_get_site_model",
+        "description": "Read the live SiteDataModel, schema URL, and model hash for this site.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "flax_get_model_hash",
+        "description": "Read the current live SiteDataModel hash for this site.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "flax_get_site_insights",
+        "description": "Read aggregate site insights when analytics access was granted.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 28}
+            },
+        },
+    },
+    {
+        "name": "flax_get_search_performance",
+        "description": "Read bounded Google Search Console performance when analytics access was granted.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 28},
+                "dimension": {"type": "string", "enum": ["query", "page"], "default": "query"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            },
+        },
+    },
+    {
+        "name": "flax_upsert_article",
+        "description": "Create or update an article and create a previewable Flax draft.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sectionId": {"type": "string"},
+                "articleId": {"type": "string"},
+                "article": {"$ref": "https://flaxsites.com/schemas/flax/v1/article.schema.json"},
+            },
+            "required": ["sectionId", "article"],
+        },
+    },
+    {
+        "name": "flax_validate_model_update",
+        "description": "Validate a model update against the current live model without creating a draft.",
+        "inputSchema": {"$ref": "https://flaxsites.com/schemas/flax/v1/model-update-request.schema.json"},
+    },
+    {
+        "name": "flax_propose_model_update",
+        "description": "Validate a model update and create a previewable owner-approved Flax draft.",
+        "inputSchema": {"$ref": "https://flaxsites.com/schemas/flax/v1/model-update-request.schema.json"},
+    },
+    {
+        "name": "flax_upload_image",
+        "description": "Upload a public HTTPS image URL to this site's image CDN.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "contentType": {"type": "string", "enum": ["image/jpeg", "image/png", "image/webp", "image/svg+xml"]},
+                "sourceUrl": {"type": "string", "format": "uri"},
+            },
+            "required": ["name", "contentType", "sourceUrl"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "flax_begin_image_upload",
+        "description": "Authorize one direct WebP upload for an agent-local image.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "totalBytes": {"type": "integer", "minimum": 1},
+                "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            },
+            "required": ["name", "totalBytes", "sha256"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "flax_get_change",
+        "description": "Read an agent-created change and its preview state for this site.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"changeId": {"type": "string"}},
+            "required": ["changeId"],
+        },
+    },
+]
+
 
 class McpStdioServer:
     def __init__(self) -> None:
@@ -443,18 +611,31 @@ class McpStdioServer:
         sys.stdout.flush()
 
     def tools(self) -> list[dict[str, Any]]:
-        tools = list(LOCAL_TOOLS)
+        tools_by_name = {
+            tool["name"]: tool for tool in [*LOCAL_TOOLS, *PROXIED_REMOTE_TOOLS]
+        }
         if self.bridge.connected():
             try:
                 remote = self.bridge.rpc("tools/list")
-                tools.extend(
-                    tool
-                    for tool in ((remote.get("result") or {}).get("tools") or [])
-                    if tool.get("name") not in BLOCKED_REMOTE_TOOLS
-                )
+                remote_result = remote.get("result")
+                if not isinstance(remote_result, dict):
+                    remote_error = remote.get("error")
+                    if isinstance(remote_error, dict) and remote_error.get("message"):
+                        raise BridgeError(str(remote_error["message"]))
+                    raise BridgeError("Flax MCP tools/list returned an invalid response")
+                remote_tools = remote_result.get("tools")
+                if not isinstance(remote_tools, list):
+                    raise BridgeError("Flax MCP tools/list returned no tool list")
+                for tool in remote_tools:
+                    if (
+                        isinstance(tool, dict)
+                        and isinstance(tool.get("name"), str)
+                        and tool["name"] not in BLOCKED_REMOTE_TOOLS
+                    ):
+                        tools_by_name[tool["name"]] = tool
             except BridgeError as error:
                 eprint(str(error))
-        return tools
+        return list(tools_by_name.values())
 
     def handle(self, message: dict[str, Any]) -> None:
         method = message.get("method")
@@ -463,10 +644,22 @@ class McpStdioServer:
             return
         if method == "initialize":
             self.initialized = True
-            self.send({"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": True}}, "serverInfo": {"name": "flax-sites", "version": PLUGIN_VERSION}}})
+            self.send({"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": True}, "resources": {}, "prompts": {}}, "serverInfo": {"name": "flax-sites", "version": PLUGIN_VERSION}}})
             return
         if method == "tools/list":
             self.send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": self.tools()}})
+            return
+        if method == "resources/list":
+            self.send({"jsonrpc": "2.0", "id": request_id, "result": {"resources": []}})
+            return
+        if method == "resources/templates/list":
+            self.send({"jsonrpc": "2.0", "id": request_id, "result": {"resourceTemplates": []}})
+            return
+        if method == "prompts/list":
+            self.send({"jsonrpc": "2.0", "id": request_id, "result": {"prompts": []}})
+            return
+        if method == "ping":
+            self.send({"jsonrpc": "2.0", "id": request_id, "result": {}})
             return
         if method == "tools/call":
             params = message.get("params") or {}
@@ -489,7 +682,14 @@ class McpStdioServer:
                 if isinstance(result, dict) and "error" in result:
                     self.send({"jsonrpc": "2.0", "id": request_id, "error": result["error"]})
                 else:
-                    self.send({"jsonrpc": "2.0", "id": request_id, "result": result.get("result", result) if isinstance(result, dict) else result})
+                    value = result.get("result", result) if isinstance(result, dict) else result
+                    self.send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "result": as_tool_result(value),
+                        }
+                    )
                 if name == "flax_connect":
                     self.send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed", "params": {}})
             except BridgeError as error:

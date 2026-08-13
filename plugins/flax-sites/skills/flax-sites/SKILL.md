@@ -23,4 +23,13 @@ Use the `flax-sites` MCP server for Flax website work.
 - Never call a publish/deploy tool. The owner publishes in Flax.
 - Treat a stale-model error as a reason to re-read the model and revalidate.
 
+## Recurring updates
+
+When the user explicitly asks for regular updates, use a task-attached heartbeat
+automation. On creation, omit `id`, use uppercase `ACTIVE`, set `kind` to
+`heartbeat`, set the current task as `targetThreadId`, set `destination` to
+`local`, and express the schedule only with `rrule`—do not send a fixed start
+timestamp. Prefer updating an existing matching automation over creating a
+duplicate, and verify creation succeeded before reporting that it is scheduled.
+
 The bridge handles PKCE, callback state, token refresh, and JSON-RPC transport. Do not recreate those mechanics in chat or expose authorization URLs as reusable links.

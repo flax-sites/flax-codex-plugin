@@ -43,8 +43,9 @@ remote MCP app/connector.
 
 ## Token storage
 
-On macOS the bridge attempts the login keychain and otherwise uses
-`~/.config/flax-sites/tokens.json` with mode `0600`. The fallback file can be
-removed with the user's normal account tools or by calling `flax_disconnect`.
-Local disconnect does not revoke the site grant; revoke access in Flax when
-that is required.
+On macOS the bridge attempts the login keychain with a bounded timeout and
+otherwise uses `~/.config/flax-sites/tokens.json` with mode `0600`. A stalled
+keychain operation therefore falls back automatically instead of blocking the
+MCP session. The fallback file can be removed with the user's normal account
+tools or by calling `flax_disconnect`. Local disconnect does not revoke the
+site grant; revoke access in Flax when that is required.
