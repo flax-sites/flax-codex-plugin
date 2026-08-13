@@ -17,6 +17,9 @@ The bundled `.mcp.json` starts:
 python3 ./scripts/flax_mcp.py
 ```
 
+The MCP manifest sets its working directory to the plugin root, so this
+relative launcher works even when Codex starts it from another directory.
+
 ## Use
 
 Ask Codex to connect to an exact site URL. Codex calls `flax_connect`, which:

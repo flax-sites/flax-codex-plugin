@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +7,13 @@ from flax_mcp import TokenStore, metadata_candidates, normalize_origin, pkce_pai
 
 
 class FlaxMcpTests(unittest.TestCase):
+    def test_mcp_manifest_runs_relative_launcher_from_plugin_root(self):
+        manifest_path = Path(__file__).parents[1] / ".mcp.json"
+        manifest = json.loads(manifest_path.read_text())
+        server = manifest["mcpServers"]["flax-sites"]
+        self.assertEqual(server["cwd"], ".")
+        self.assertEqual(server["args"], ["./scripts/flax_mcp.py"])
+
     def test_normalize_origin_discards_path_and_query(self):
         self.assertEqual(
             normalize_origin("https://example.com/some/page?x=1"),
