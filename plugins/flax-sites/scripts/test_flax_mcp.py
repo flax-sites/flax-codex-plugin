@@ -8,11 +8,13 @@ from pathlib import Path
 from unittest import mock
 
 from flax_mcp import (
+    BridgeError,
     FlaxBridge,
     McpStdioServer,
     TokenStore,
     merge_query_params,
     metadata_candidates,
+    normalize_audit_path,
     normalize_origin,
     pkce_pair,
 )
@@ -51,6 +53,7 @@ class FlaxMcpTests(unittest.TestCase):
         by_id = {response["id"]: response for response in responses}
         tool_names = [tool["name"] for tool in by_id[2]["result"]["tools"]]
         self.assertIn("flax_connect", tool_names)
+        self.assertIn("flax_audit_public_site", tool_names)
         self.assertIn("flax_get_site_model", tool_names)
         self.assertIn("flax_get_model_hash", tool_names)
         self.assertEqual(by_id[3]["result"], {"resources": []})
@@ -141,8 +144,101 @@ class FlaxMcpTests(unittest.TestCase):
         server.bridge = Bridge()
         names = [tool["name"] for tool in server.tools()]
         self.assertIn("flax_connect", names)
+        self.assertIn("flax_audit_public_site", names)
         self.assertIn("flax_get_site_model", names)
         self.assertIn("flax_get_model_hash", names)
+
+    def test_audit_paths_must_stay_on_connected_origin(self):
+        self.assertEqual(normalize_audit_path("/services?area=salford"), "/services?area=salford")
+        for path in ["https://evil.example/", "//evil.example/", "services", "/#part"]:
+            with self.subTest(path=path):
+                with self.assertRaises(BridgeError):
+                    normalize_audit_path(path)
+
+    def test_public_site_audit_extracts_structured_technical_data(self):
+        class Store:
+            def load(self):
+                return {
+                    "access_token": "test",
+                    "site_url": "https://site.example",
+                }
+
+        html = """<!doctype html><html><head>
+        <title>  Example Site </title>
+        <meta content="Example description" name="description">
+        <meta content="index,follow" name="robots">
+        <link href="https://site.example/services" rel="canonical">
+        <script type="application/ld+json">{"@graph":[{"@type":"LocalBusiness"},{"@type":["Service","Thing"]}]}</script>
+        </head><body><h1>Artificial <span>Grass</span></h1></body></html>"""
+        responses = {
+            "https://site.example/services": (
+                200,
+                {"Content-Type": "text/html; charset=utf-8"},
+                html,
+            ),
+            "https://site.example/robots.txt": (
+                200,
+                {"Content-Type": "text/plain"},
+                "User-agent: *\nSitemap: https://site.example/sitemap.xml\n",
+            ),
+            "https://site.example/sitemap.xml": (
+                200,
+                {"Content-Type": "application/xml"},
+                "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><url><loc>https://site.example/</loc></url><url><loc>https://site.example/services</loc></url></urlset>",
+            ),
+        }
+        bridge = FlaxBridge(Store())
+        with mock.patch(
+            "flax_mcp.public_text_request", side_effect=lambda url: responses[url]
+        ):
+            result = bridge.audit_public_site(["/services"])
+
+        page = result["pages"][0]
+        self.assertEqual(result["siteUrl"], "https://site.example")
+        self.assertEqual(page["title"], "Example Site")
+        self.assertEqual(page["description"], "Example description")
+        self.assertEqual(page["canonical"], "https://site.example/services")
+        self.assertEqual(page["robots"], "index,follow")
+        self.assertEqual(page["h1"], ["Artificial Grass"])
+        self.assertEqual(page["schemaTypes"], ["LocalBusiness", "Service", "Thing"])
+        self.assertIn("User-agent: *", result["indexing"]["robots"]["text"])
+        self.assertEqual(result["indexing"]["sitemap"]["urlCount"], 2)
+
+    def test_public_site_audit_requires_an_authenticated_site(self):
+        class Store:
+            def load(self):
+                return None
+
+        with self.assertRaises(BridgeError):
+            FlaxBridge(Store()).audit_public_site(["/"])
+
+    def test_public_site_audit_tool_returns_call_tool_result(self):
+        class Bridge:
+            def audit_public_site(self, paths, include_indexing_files):
+                self.call = (paths, include_indexing_files)
+                return {"siteUrl": "https://site.example", "pages": []}
+
+        server = McpStdioServer()
+        server.bridge = Bridge()
+        messages = []
+        server.send = messages.append
+        server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "flax_audit_public_site",
+                    "arguments": {
+                        "paths": ["/services"],
+                        "includeIndexingFiles": False,
+                    },
+                },
+            }
+        )
+        payload = json.loads(messages[0]["result"]["content"][0]["text"])
+        self.assertEqual(payload["siteUrl"], "https://site.example")
+        self.assertEqual(server.bridge.call, (["/services"], False))
 
     def test_resource_and_prompt_probes_return_empty_lists(self):
         server = McpStdioServer()

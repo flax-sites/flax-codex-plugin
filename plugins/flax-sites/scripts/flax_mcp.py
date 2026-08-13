@@ -22,6 +22,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,9 @@ TOKEN_ACCOUNT = "default"
 TOKEN_FILE = Path.home() / ".config" / "flax-sites" / "tokens.json"
 CALLBACK_TIMEOUT_SECONDS = 300
 KEYCHAIN_TIMEOUT_SECONDS = 5
+MAX_AUDIT_PATHS = 12
+MAX_PUBLIC_RESPONSE_BYTES = 1024 * 1024
+MAX_SITEMAP_URLS = 500
 BLOCKED_REMOTE_TOOLS = {"flax_publish_change"}
 
 
@@ -100,6 +105,166 @@ def json_request(
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
         return None
+
+
+def public_text_request(
+    url: str, timeout: float = 20
+) -> tuple[int, dict[str, str], str]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml,text/xml,text/plain",
+            "User-Agent": "Flax-Codex-Site-Audit/1.0",
+        },
+        method="GET",
+    )
+    opener = urllib.request.build_opener(NoRedirectHandler())
+
+    def read_response(response: Any) -> tuple[int, dict[str, str], str]:
+        raw = response.read(MAX_PUBLIC_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_PUBLIC_RESPONSE_BYTES:
+            raise BridgeError(f"Public page response exceeded {MAX_PUBLIC_RESPONSE_BYTES} bytes")
+        headers = dict(response.headers.items())
+        return response.status, headers, raw.decode("utf-8", errors="replace")
+
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return read_response(response)
+    except urllib.error.HTTPError as error:
+        return read_response(error)
+    except urllib.error.URLError as error:
+        raise BridgeError(f"Could not reach {url}: {error.reason}") from error
+
+
+class PageMetadataParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title_parts: list[str] = []
+        self.h1_values: list[str] = []
+        self.description: str | None = None
+        self.canonical: str | None = None
+        self.robots: str | None = None
+        self.json_ld_values: list[str] = []
+        self._in_title = False
+        self._h1_parts: list[str] | None = None
+        self._json_ld_parts: list[str] | None = None
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        attributes = {name.lower(): value or "" for name, value in attrs}
+        lowered = tag.lower()
+        if lowered == "title":
+            self._in_title = True
+        elif lowered == "h1":
+            self._h1_parts = []
+        elif lowered == "meta":
+            name = attributes.get("name", "").lower()
+            if name == "description" and self.description is None:
+                self.description = attributes.get("content") or None
+            elif name == "robots" and self.robots is None:
+                self.robots = attributes.get("content") or None
+        elif lowered == "link":
+            rel = attributes.get("rel", "").lower().split()
+            if "canonical" in rel and self.canonical is None:
+                self.canonical = attributes.get("href") or None
+        elif (
+            lowered == "script"
+            and attributes.get("type", "").lower() == "application/ld+json"
+        ):
+            self._json_ld_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.lower()
+        if lowered == "title":
+            self._in_title = False
+        elif lowered == "h1" and self._h1_parts is not None:
+            value = " ".join("".join(self._h1_parts).split())
+            if value:
+                self.h1_values.append(value)
+            self._h1_parts = None
+        elif lowered == "script" and self._json_ld_parts is not None:
+            value = "".join(self._json_ld_parts).strip()
+            if value:
+                self.json_ld_values.append(value)
+            self._json_ld_parts = None
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.title_parts.append(data)
+        if self._h1_parts is not None:
+            self._h1_parts.append(data)
+        if self._json_ld_parts is not None:
+            self._json_ld_parts.append(data)
+
+
+def page_metadata(html: str) -> dict[str, Any]:
+    parser = PageMetadataParser()
+    parser.feed(html)
+    schema_types: set[str] = set()
+
+    def collect_schema_types(value: Any) -> None:
+        if isinstance(value, dict):
+            type_value = value.get("@type")
+            if isinstance(type_value, str):
+                schema_types.add(type_value)
+            elif isinstance(type_value, list):
+                schema_types.update(item for item in type_value if isinstance(item, str))
+            for child in value.values():
+                collect_schema_types(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect_schema_types(child)
+
+    for raw_json_ld in parser.json_ld_values:
+        try:
+            collect_schema_types(json.loads(raw_json_ld))
+        except json.JSONDecodeError:
+            continue
+
+    title = " ".join("".join(parser.title_parts).split()) or None
+    return {
+        "title": title,
+        "description": parser.description,
+        "canonical": parser.canonical,
+        "robots": parser.robots,
+        "h1Count": len(parser.h1_values),
+        "h1": parser.h1_values,
+        "schemaTypes": sorted(schema_types),
+    }
+
+
+def sitemap_summary(xml_text: str) -> dict[str, Any]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as error:
+        return {"urlCount": 0, "urls": [], "parseError": str(error)}
+    urls = [
+        (element.text or "").strip()
+        for element in root.iter()
+        if element.tag.rsplit("}", 1)[-1] == "loc" and (element.text or "").strip()
+    ]
+    return {
+        "urlCount": len(urls),
+        "urls": urls[:MAX_SITEMAP_URLS],
+        "truncated": len(urls) > MAX_SITEMAP_URLS,
+    }
+
+
+def normalize_audit_path(path: str) -> str:
+    if not isinstance(path, str) or not path.strip():
+        raise BridgeError("Every audit path must be a non-empty relative site path")
+    value = path.strip()
+    parsed = urllib.parse.urlsplit(value)
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or not parsed.path.startswith("/")
+        or value.startswith("//")
+        or parsed.fragment
+    ):
+        raise BridgeError("Audit paths must be relative paths on the connected site")
+    return urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
 
 
 def form_request(
@@ -427,6 +592,55 @@ class FlaxBridge:
         finally:
             server.shutdown()
 
+    def audit_public_site(
+        self,
+        paths: Any = None,
+        include_indexing_files: Any = True,
+    ) -> dict[str, Any]:
+        token = self.store.load() or {}
+        if not token.get("access_token") or not token.get("site_url"):
+            raise BridgeError("Connect Flax first with flax_connect")
+        if paths is None:
+            paths = ["/"]
+        if not isinstance(paths, list) or not paths or len(paths) > MAX_AUDIT_PATHS:
+            raise BridgeError(f"Provide between 1 and {MAX_AUDIT_PATHS} audit paths")
+        if not isinstance(include_indexing_files, bool):
+            raise BridgeError("includeIndexingFiles must be a boolean")
+
+        origin = normalize_origin(token["site_url"])
+        normalized_paths = [normalize_audit_path(path) for path in paths]
+
+        def fetch(path: str) -> tuple[dict[str, Any], str]:
+            status, headers, body = public_text_request(f"{origin}{path}")
+            lowered_headers = {name.lower(): value for name, value in headers.items()}
+            result = {
+                "path": path,
+                "status": status,
+                "contentType": lowered_headers.get("content-type"),
+                "contentCharacters": len(body),
+            }
+            if lowered_headers.get("location"):
+                result["location"] = lowered_headers["location"]
+            return result, body
+
+        pages = []
+        for path in normalized_paths:
+            summary, body = fetch(path)
+            content_type = str(summary.get("contentType") or "").lower()
+            if "html" in content_type or (summary["status"] == 200 and body.lstrip().startswith("<")):
+                summary.update(page_metadata(body))
+            pages.append(summary)
+
+        result: dict[str, Any] = {"siteUrl": origin, "pages": pages}
+        if include_indexing_files:
+            robots, robots_body = fetch("/robots.txt")
+            robots["text"] = robots_body[:100_000]
+            robots["truncated"] = len(robots_body) > 100_000
+            sitemap, sitemap_body = fetch("/sitemap.xml")
+            sitemap.update(sitemap_summary(sitemap_body))
+            result["indexing"] = {"robots": robots, "sitemap": sitemap}
+        return result
+
     def refresh(self, token: dict[str, Any]) -> dict[str, Any]:
         refresh_token = token.get("refresh_token")
         if not refresh_token:
@@ -493,6 +707,29 @@ LOCAL_TOOLS = [
         "name": "flax_disconnect",
         "description": "Remove the local Flax OAuth connection. This does not revoke access in Flax.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "flax_audit_public_site",
+        "description": "Audit public HTML metadata, status, robots.txt, and sitemap.xml only on the exact connected Flax site. Use this instead of a general web reader or shell commands for technical site checks.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^/"},
+                    "minItems": 1,
+                    "maxItems": MAX_AUDIT_PATHS,
+                    "default": ["/"],
+                },
+                "includeIndexingFiles": {"type": "boolean", "default": True},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": True,
+            "openWorldHint": True,
+            "destructiveHint": False,
+        },
     },
 ]
 
@@ -675,6 +912,11 @@ class McpStdioServer:
                     self.bridge.store.clear()
                     self.bridge.session_id = None
                     result = {"message": "The local Flax connection was removed. Revoke it in Flax if needed."}
+                elif name == "flax_audit_public_site":
+                    result = self.bridge.audit_public_site(
+                        arguments.get("paths"),
+                        arguments.get("includeIndexingFiles", True),
+                    )
                 elif name in BLOCKED_REMOTE_TOOLS:
                     raise BridgeError("Publishing is disabled in the local Flax plugin")
                 else:

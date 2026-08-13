@@ -14,6 +14,7 @@ Use the `flax-sites` MCP server for Flax website work.
 3. Keep the connection bound to the site returned by that origin's `/.well-known/mcp.json`. Do not substitute the global endpoint or enumerate other sites.
 4. Read the current model and hash before proposing any change.
 5. Only inspect analytics or search-performance tools when the user explicitly asks for analytics.
+6. For public technical checks, call `flax_audit_public_site` with selected relative paths. Use its structured page, robots, and sitemap results instead of a general web reader or shell HTTP/parser commands.
 
 ## Change workflow
 

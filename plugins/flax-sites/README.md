@@ -30,6 +30,11 @@ Ask Codex to connect to an exact site URL. Codex calls `flax_connect`, which:
 4. Opens a one-time browser consent flow on `127.0.0.1`.
 5. Stores the resulting token locally and proxies the site's MCP tools.
 
+The local `flax_audit_public_site` tool performs bounded read-only checks of
+HTML metadata, `robots.txt`, and `sitemap.xml` on that exact connected origin.
+It accepts relative paths only and avoids general web-reader or shell-parser
+fallbacks during technical reviews.
+
 No credentials, authorization codes, or tokens should be pasted into chat.
 The bridge never calls Flax publishing tools; owners publish approved drafts in
 Flax.
