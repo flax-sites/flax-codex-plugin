@@ -1,6 +1,6 @@
 {
   "name": "flax-sites",
-  "version": "0.1.0+codex.20260813151227",
+  "version": "0.1.0+codex.20260814064836",
   "description": "Connect Codex to Flax Sites with browser OAuth and site-scoped MCP tools.",
   "author": {
     "name": "Flax"

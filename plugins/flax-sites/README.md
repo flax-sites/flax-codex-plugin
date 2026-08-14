@@ -28,7 +28,13 @@ Ask Codex to connect to an exact site URL. Codex calls `flax_connect`, which:
 2. Follows the advertised site-scoped protected-resource and OAuth metadata.
 3. Registers a short-lived public OAuth client and generates S256 PKCE.
 4. Opens a one-time browser consent flow on `127.0.0.1`.
-5. Stores the resulting token locally and proxies the site's MCP tools.
+5. Stores the resulting token locally under that site origin and proxies the site's MCP tools.
+
+The local bridge can retain multiple authorized site origins for the same Codex
+client. Calling `flax_connect` for a site that is already authorized selects it
+without opening another browser flow. `flax_connection_status` lists all saved
+sites, and `flax_disconnect` removes only the active site unless a `siteUrl` is
+provided.
 
 The local `flax_audit_public_site` tool performs bounded read-only checks of
 HTML metadata, `robots.txt`, and `sitemap.xml` on that exact connected origin.

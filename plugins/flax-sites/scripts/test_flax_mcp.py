@@ -135,6 +135,34 @@ class FlaxMcpTests(unittest.TestCase):
                     store.clear()
             self.assertIsNone(store.load())
 
+    def test_keychain_write_passes_json_as_the_password_and_verifies_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tokens.json"
+            store = TokenStore(path)
+            value = {
+                "version": 2,
+                "access_token": "test",
+                "site_url": "https://site.example",
+            }
+            add_result = subprocess.CompletedProcess(
+                ["security"], 0, "", ""
+            )
+            invalid_find_result = subprocess.CompletedProcess(
+                ["security"], 0, "\n", ""
+            )
+            with mock.patch.object(store, "_keychain_available", return_value=True):
+                with mock.patch(
+                    "flax_mcp.subprocess.run",
+                    side_effect=[add_result, invalid_find_result],
+                ) as run:
+                    store.save(value)
+
+            add_call = run.call_args_list[0]
+            self.assertEqual(add_call.args[0][-2:], ["-w", json.dumps(value, separators=(",", ":"))])
+            self.assertNotIn("input", add_call.kwargs)
+            self.assertEqual(store.load(), value)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_proxy_tools_are_declared_before_authentication(self):
         class Bridge:
             def connected(self):
@@ -214,8 +242,8 @@ class FlaxMcpTests(unittest.TestCase):
 
     def test_public_site_audit_tool_returns_call_tool_result(self):
         class Bridge:
-            def audit_public_site(self, paths, include_indexing_files):
-                self.call = (paths, include_indexing_files)
+            def audit_public_site(self, paths, include_indexing_files, site_url):
+                self.call = (paths, include_indexing_files, site_url)
                 return {"siteUrl": "https://site.example", "pages": []}
 
         server = McpStdioServer()
@@ -238,7 +266,7 @@ class FlaxMcpTests(unittest.TestCase):
         )
         payload = json.loads(messages[0]["result"]["content"][0]["text"])
         self.assertEqual(payload["siteUrl"], "https://site.example")
-        self.assertEqual(server.bridge.call, (["/services"], False))
+        self.assertEqual(server.bridge.call, (["/services"], False, None))
 
     def test_resource_and_prompt_probes_return_empty_lists(self):
         server = McpStdioServer()
@@ -271,6 +299,209 @@ class FlaxMcpTests(unittest.TestCase):
             self.assertEqual(result["siteUrl"], "https://example.com")
             self.assertIn("already connected", result["message"])
 
+    def test_connect_fails_fast_when_browser_cannot_open(self):
+        discovery = {
+            "mcp": {
+                "url": "https://agents.example/site-mcp/site-1/mcp",
+                "protectedResourceMetadataUrl": "https://agents.example/site-mcp/site-1/protected",
+            }
+        }
+        protected = {
+            "authorization_servers": ["https://agents.example/site-mcp/site-1/oauth"],
+            "scopes_supported": ["openid"],
+        }
+        authorization_metadata = {
+            "registration_endpoint": "https://agents.example/site-mcp/site-1/oauth/register",
+            "authorization_endpoint": "https://flaxsites.com/oauth/site-context",
+            "token_endpoint": "https://agents.example/oauth/token",
+            "scopes_supported": ["openid"],
+        }
+
+        class Server:
+            def shutdown(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenStore(Path(directory) / "tokens.json")
+            with mock.patch(
+                "flax_mcp.json_request",
+                side_effect=[
+                    (200, {}, discovery),
+                    (200, {}, protected),
+                    (200, {}, authorization_metadata),
+                    (201, {}, {"client_id": "client-1"}),
+                ],
+            ):
+                with mock.patch(
+                    "flax_mcp.start_callback_server",
+                    return_value=(Server(), "http://127.0.0.1:1234/oauth/callback"),
+                ):
+                    with mock.patch("flax_mcp.webbrowser.open", return_value=False):
+                        with self.assertRaisesRegex(
+                            BridgeError, "browser use is unavailable"
+                        ):
+                            FlaxBridge(store).connect("https://site.example")
+
+    def test_connection_persistence_is_verified_before_success(self):
+        class Store:
+            def load(self):
+                return None
+
+            def save(self, _value):
+                return None
+
+        token = {
+            "access_token": "test",
+            "mcp_url": "https://agents.example/site-mcp/site-1/mcp",
+            "site_url": "https://site.example",
+        }
+        with self.assertRaisesRegex(BridgeError, "could not be persisted"):
+            FlaxBridge(Store())._save_connections(
+                {"https://site.example": token}, "https://site.example"
+            )
+
+    def test_registration_failure_reports_http_status_and_provider_detail(self):
+        discovery = {
+            "mcp": {
+                "url": "https://agents.example/site-mcp/site-1/mcp",
+                "protectedResourceMetadataUrl": "https://agents.example/site-mcp/site-1/protected",
+            }
+        }
+        protected = {
+            "authorization_servers": ["https://agents.example/site-mcp/site-1/oauth"],
+            "scopes_supported": ["openid"],
+        }
+        authorization_metadata = {
+            "registration_endpoint": "https://agents.example/site-mcp/site-1/oauth/register",
+            "scopes_supported": ["openid"],
+        }
+
+        class Server:
+            def shutdown(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenStore(Path(directory) / "tokens.json")
+            with mock.patch(
+                "flax_mcp.json_request",
+                side_effect=[
+                    (200, {}, discovery),
+                    (200, {}, protected),
+                    (200, {}, authorization_metadata),
+                    (
+                        400,
+                        {},
+                        {
+                            "error": "invalid_client_metadata",
+                            "error_description": "redirect URI is not allowed",
+                        },
+                    ),
+                ],
+            ):
+                with mock.patch(
+                    "flax_mcp.start_callback_server",
+                    return_value=(Server(), "http://127.0.0.1:1234/oauth/callback"),
+                ):
+                    with self.assertRaisesRegex(
+                        BridgeError,
+                        r"registration failed \(HTTP 400\): redirect URI is not allowed",
+                    ):
+                        FlaxBridge(store).connect("https://site.example")
+
+    def test_multiple_site_connections_are_retained_and_selectable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenStore(Path(directory) / "tokens.json")
+            store.save(
+                {
+                    "version": 2,
+                    "active_site_url": "https://first.example",
+                    "connections": {
+                        "https://first.example": {
+                            "access_token": "first",
+                            "expires_at": 4102444800,
+                            "mcp_url": "https://agents.example/site-mcp/first/mcp",
+                            "site_url": "https://first.example",
+                        },
+                        "https://second.example": {
+                            "access_token": "second",
+                            "expires_at": 4102444800,
+                            "mcp_url": "https://agents.example/site-mcp/second/mcp",
+                            "site_url": "https://second.example",
+                        },
+                    },
+                }
+            )
+
+            bridge = FlaxBridge(store)
+            result = bridge.connect("https://second.example/page")
+
+            self.assertIn("already connected", result["message"])
+            status = bridge.connection_status()
+            self.assertEqual(status["siteUrl"], "https://second.example")
+            self.assertEqual(
+                status["connectedSites"],
+                ["https://first.example", "https://second.example"],
+            )
+            disconnected = bridge.disconnect("https://first.example")
+            self.assertEqual(disconnected["siteUrl"], "https://first.example")
+            self.assertEqual(disconnected["connectedSites"], ["https://second.example"])
+
+    def test_legacy_single_connection_is_migrated_when_selected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenStore(Path(directory) / "tokens.json")
+            store.save(
+                {
+                    "access_token": "legacy",
+                    "expires_at": 4102444800,
+                    "mcp_url": "https://agents.example/site-mcp/legacy/mcp",
+                    "site_url": "https://legacy.example",
+                }
+            )
+
+            FlaxBridge(store).connect("https://legacy.example")
+            migrated = store.load()
+            self.assertEqual(migrated["active_site_url"], "https://legacy.example")
+            self.assertIn("https://legacy.example", migrated["connections"])
+
+    def test_rpc_uses_the_selected_site_connection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenStore(Path(directory) / "tokens.json")
+            store.save(
+                {
+                    "version": 2,
+                    "active_site_url": "https://second.example",
+                    "connections": {
+                        "https://first.example": {
+                            "access_token": "first",
+                            "expires_at": 4102444800,
+                            "mcp_url": "https://agents.example/site-mcp/first/mcp",
+                            "site_url": "https://first.example",
+                        },
+                        "https://second.example": {
+                            "access_token": "second",
+                            "expires_at": 4102444800,
+                            "mcp_url": "https://agents.example/site-mcp/second/mcp",
+                            "site_url": "https://second.example",
+                        },
+                    },
+                }
+            )
+            bridge = FlaxBridge(store)
+            with mock.patch(
+                "flax_mcp.json_request",
+                return_value=(200, {}, {"jsonrpc": "2.0", "result": {"tools": []}}),
+            ) as request:
+                bridge.rpc("tools/list")
+
+            self.assertEqual(
+                request.call_args.args[0],
+                "https://agents.example/site-mcp/second/mcp",
+            )
+            self.assertEqual(
+                request.call_args.kwargs["headers"]["Authorization"],
+                "Bearer second",
+            )
+
     def test_local_tool_call_returns_mcp_call_tool_result(self):
         class Store:
             def load(self):
@@ -278,6 +509,13 @@ class FlaxMcpTests(unittest.TestCase):
 
         class Bridge:
             store = Store()
+
+            def connection_status(self):
+                return {
+                    "connected": True,
+                    "siteUrl": "https://example.com",
+                    "connectedSites": ["https://example.com"],
+                }
 
         server = McpStdioServer()
         server.bridge = Bridge()
@@ -295,7 +533,11 @@ class FlaxMcpTests(unittest.TestCase):
         self.assertEqual(result["content"][0]["type"], "text")
         self.assertEqual(
             json.loads(result["content"][0]["text"]),
-            {"connected": True, "siteUrl": "https://example.com"},
+            {
+                "connected": True,
+                "siteUrl": "https://example.com",
+                "connectedSites": ["https://example.com"],
+            },
         )
 
     def test_successful_connect_returns_tool_result_before_discovery_notification(self):

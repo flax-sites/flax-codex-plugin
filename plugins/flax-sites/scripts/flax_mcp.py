@@ -17,6 +17,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -32,8 +33,9 @@ PLUGIN_VERSION = "0.1.0"
 TOKEN_SERVICE = "flax-sites-codex"
 TOKEN_ACCOUNT = "default"
 TOKEN_FILE = Path.home() / ".config" / "flax-sites" / "tokens.json"
-CALLBACK_TIMEOUT_SECONDS = 300
+CALLBACK_TIMEOUT_SECONDS = 60
 KEYCHAIN_TIMEOUT_SECONDS = 5
+TOKEN_STORAGE_VERSION = 2
 MAX_AUDIT_PATHS = 12
 MAX_PUBLIC_RESPONSE_BYTES = 1024 * 1024
 MAX_SITEMAP_URLS = 500
@@ -352,36 +354,47 @@ class TokenStore:
         except subprocess.TimeoutExpired:
             return False
 
-    def load(self) -> dict[str, Any] | None:
-        if self._keychain_available():
-            try:
-                result = subprocess.run(
-                    [
-                        "security",
-                        "find-generic-password",
-                        "-s",
-                        TOKEN_SERVICE,
-                        "-a",
-                        TOKEN_ACCOUNT,
-                        "-w",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=KEYCHAIN_TIMEOUT_SECONDS,
-                )
-            except subprocess.TimeoutExpired:
-                result = None
-            if result and result.returncode == 0 and result.stdout.strip():
-                try:
-                    return json.loads(result.stdout)
-                except json.JSONDecodeError:
-                    pass
-        if not self.path.exists():
+    def _keychain_value(self) -> dict[str, Any] | None:
+        if not self._keychain_available():
             return None
         try:
-            return json.loads(self.path.read_text())
-        except (OSError, json.JSONDecodeError):
+            result = subprocess.run(
+                [
+                    "security",
+                    "find-generic-password",
+                    "-s",
+                    TOKEN_SERVICE,
+                    "-a",
+                    TOKEN_ACCOUNT,
+                    "-w",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=KEYCHAIN_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
             return None
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        try:
+            value = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
+
+    def load(self) -> dict[str, Any] | None:
+        # A file is only written when Keychain is unavailable or its round-trip
+        # verification fails. Prefer it so a stale/invalid Keychain item cannot
+        # mask a successfully persisted fallback connection.
+        if not self.path.exists():
+            return self._keychain_value()
+        try:
+            file_value = json.loads(self.path.read_text())
+        except (OSError, json.JSONDecodeError):
+            file_value = None
+        if isinstance(file_value, dict):
+            return file_value
+        return self._keychain_value()
 
     def save(self, value: dict[str, Any]) -> None:
         encoded = json.dumps(value, separators=(",", ":"))
@@ -397,19 +410,42 @@ class TokenStore:
                         "-a",
                         TOKEN_ACCOUNT,
                         "-w",
+                        encoded,
                     ],
-                    input=encoded,
                     capture_output=True,
                     text=True,
                     timeout=KEYCHAIN_TIMEOUT_SECONDS,
                 )
             except subprocess.TimeoutExpired:
                 result = None
-            if result and result.returncode == 0:
+            if result and result.returncode == 0 and self._keychain_value() == value:
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
                 return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(value, indent=2) + "\n")
-        os.chmod(self.path, 0o600)
+        temporary_path: str | None = None
+        try:
+            file_descriptor, temporary_path = tempfile.mkstemp(
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                dir=self.path.parent,
+                text=True,
+            )
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary:
+                temporary.write(json.dumps(value, indent=2) + "\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.chmod(temporary_path, 0o600)
+            os.replace(temporary_path, self.path)
+        except OSError:
+            if temporary_path:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+            raise
 
     def clear(self) -> None:
         if self._keychain_available():
@@ -468,19 +504,123 @@ class FlaxBridge:
         self.store = store or TokenStore()
         self.session_id: str | None = None
 
+    def _connections(self) -> tuple[dict[str, dict[str, Any]], str | None]:
+        """Load the site-keyed store, migrating the former single-token shape."""
+        stored = self.store.load() or {}
+        candidates: list[tuple[Any, Any]] = []
+        if isinstance(stored, dict) and isinstance(stored.get("connections"), dict):
+            candidates = list(stored["connections"].items())
+        elif isinstance(stored, dict) and stored.get("site_url"):
+            candidates = [(stored.get("site_url"), stored)]
+
+        connections: dict[str, dict[str, Any]] = {}
+        for key, candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            site_value = candidate.get("site_url") or key
+            if not isinstance(site_value, str):
+                continue
+            try:
+                origin = normalize_origin(site_value)
+            except BridgeError:
+                continue
+            token = dict(candidate)
+            token["site_url"] = origin
+            connections[origin] = token
+
+        active_value = stored.get("active_site_url") if isinstance(stored, dict) else None
+        if not isinstance(active_value, str) and isinstance(stored, dict):
+            active_value = stored.get("site_url")
+        active_site: str | None = None
+        if isinstance(active_value, str):
+            try:
+                normalized_active = normalize_origin(active_value)
+            except BridgeError:
+                normalized_active = None
+            if normalized_active in connections:
+                active_site = normalized_active
+        if active_site is None and connections:
+            active_site = next(iter(connections))
+        return connections, active_site
+
+    def _save_connections(
+        self,
+        connections: dict[str, dict[str, Any]],
+        active_site_url: str | None,
+    ) -> None:
+        active = active_site_url if active_site_url in connections else None
+        try:
+            self.store.save(
+                {
+                    "version": TOKEN_STORAGE_VERSION,
+                    "active_site_url": active,
+                    "connections": connections,
+                }
+            )
+        except OSError as error:
+            raise BridgeError(
+                "Flax connection could not be persisted locally; check local credential storage and try again"
+            ) from error
+        if active is None:
+            return
+        persisted_connections, persisted_active = self._connections()
+        expected = connections.get(active) or {}
+        persisted = persisted_connections.get(active) or {}
+        if (
+            persisted_active != active
+            or persisted.get("access_token") != expected.get("access_token")
+            or persisted.get("mcp_url") != expected.get("mcp_url")
+        ):
+            raise BridgeError(
+                "Flax connection could not be persisted locally; check local credential storage and try again"
+            )
+
+    def _active_token(self) -> dict[str, Any] | None:
+        connections, active_site = self._connections()
+        return connections.get(active_site) if active_site else None
+
+    def _token_for_site(self, site_url: str | None = None) -> dict[str, Any]:
+        connections, active_site = self._connections()
+        target = normalize_origin(site_url) if site_url else active_site
+        token = connections.get(target) if target else None
+        if not token or not token.get("access_token") or not token.get("site_url"):
+            raise BridgeError("Connect Flax first with flax_connect")
+        return token
+
+    def connection_status(self) -> dict[str, Any]:
+        connections, active_site = self._connections()
+        sites = sorted(
+            site_url
+            for site_url, token in connections.items()
+            if token.get("mcp_url")
+            and (token.get("access_token") or token.get("refresh_token"))
+        )
+        return {
+            "connected": bool(active_site and active_site in sites),
+            "siteUrl": active_site if active_site in sites else None,
+            "connectedSites": sites,
+        }
+
     def connected(self) -> bool:
-        token = self.store.load()
-        return bool(token and token.get("access_token") and token.get("mcp_url"))
+        token = self._active_token()
+        return bool(
+            token
+            and token.get("mcp_url")
+            and (token.get("access_token") or token.get("refresh_token"))
+        )
 
     def connect(self, site_url: str) -> dict[str, Any]:
         origin = normalize_origin(site_url)
-        existing = self.store.load() or {}
+        connections, _ = self._connections()
+        existing = connections.get(origin) or {}
         same_site = existing.get("site_url") == origin
         has_current_access = bool(existing.get("access_token")) and existing.get(
             "expires_at", 0
         ) >= time.time() + 30
         can_refresh = bool(existing.get("refresh_token"))
         if same_site and existing.get("mcp_url") and (has_current_access or can_refresh):
+            self._save_connections(connections, origin)
+            self.session_id = None
             return {
                 "siteUrl": origin,
                 "message": "Flax is already connected for this site.",
@@ -531,7 +671,19 @@ class FlaxBridge:
                 body=registration,
             )
             if status < 200 or status >= 300 or not isinstance(client, dict):
-                raise BridgeError("Flax OAuth client registration failed")
+                detail = ""
+                if isinstance(client, dict):
+                    raw_detail = (
+                        client.get("error_description")
+                        or client.get("error")
+                        or client.get("message")
+                    )
+                    if isinstance(raw_detail, str):
+                        detail = " ".join(raw_detail.split())[:240]
+                suffix = f": {detail}" if detail else ""
+                raise BridgeError(
+                    f"Flax OAuth client registration failed (HTTP {status}){suffix}"
+                )
             client_id = client.get("client_id")
             if not isinstance(client_id, str):
                 raise BridgeError("Flax OAuth registration returned no client ID")
@@ -552,10 +704,18 @@ class FlaxBridge:
                 authorization_metadata["authorization_endpoint"], params
             )
             eprint("Opening Flax authorization in your browser…")
-            if not webbrowser.open(authorization_url):
-                eprint(f"Open this one-time URL in your browser: {authorization_url}")
+            try:
+                browser_opened = webbrowser.open(authorization_url)
+            except webbrowser.Error:
+                browser_opened = False
+            if not browser_opened:
+                raise BridgeError(
+                    "Flax OAuth requires browser access, but browser use is unavailable. Enable browser access and retry flax_connect."
+                )
             if not CallbackHandler.event.wait(CALLBACK_TIMEOUT_SECONDS):
-                raise BridgeError("Timed out waiting for the Flax OAuth callback")
+                raise BridgeError(
+                    "Timed out waiting for the Flax OAuth callback. Browser access may be unavailable; retry flax_connect when it is enabled."
+                )
             callback = CallbackHandler.result or {}
             if callback.get("state") != state:
                 raise BridgeError("Flax OAuth state verification failed")
@@ -586,20 +746,38 @@ class FlaxBridge:
                     "expires_at": time.time() + int(token.get("expires_in", 3600)),
                 }
             )
-            self.store.save(token)
+            connections[origin] = token
+            self._save_connections(connections, origin)
             self.session_id = None
             return {"siteUrl": origin, "message": "Flax is connected for this site."}
         finally:
             server.shutdown()
 
+    def disconnect(self, site_url: str | None = None) -> dict[str, Any]:
+        connections, active_site = self._connections()
+        target = normalize_origin(site_url) if site_url else active_site
+        if not target or target not in connections:
+            raise BridgeError("No local Flax connection exists for that site")
+        del connections[target]
+        next_active = next(iter(sorted(connections)), None)
+        if connections:
+            self._save_connections(connections, next_active)
+        else:
+            self.store.clear()
+        self.session_id = None
+        return {
+            "siteUrl": target,
+            "connectedSites": sorted(connections),
+            "message": "The local Flax connection was removed. Revoke it in Flax if needed.",
+        }
+
     def audit_public_site(
         self,
         paths: Any = None,
         include_indexing_files: Any = True,
+        site_url: str | None = None,
     ) -> dict[str, Any]:
-        token = self.store.load() or {}
-        if not token.get("access_token") or not token.get("site_url"):
-            raise BridgeError("Connect Flax first with flax_connect")
+        token = self._token_for_site(site_url)
         if paths is None:
             paths = ["/"]
         if not isinstance(paths, list) or not paths or len(paths) > MAX_AUDIT_PATHS:
@@ -656,11 +834,14 @@ class FlaxBridge:
         if status < 200 or status >= 300 or not isinstance(refreshed, dict) or not refreshed.get("access_token"):
             raise BridgeError("Flax token refresh failed; call flax_connect again")
         merged = {**token, **refreshed, "expires_at": time.time() + int(refreshed.get("expires_in", 3600))}
-        self.store.save(merged)
+        connections, active_site = self._connections()
+        origin = normalize_origin(merged["site_url"])
+        connections[origin] = merged
+        self._save_connections(connections, active_site or origin)
         return merged
 
     def rpc(self, method: str, params: dict[str, Any] | None = None) -> Any:
-        token = self.store.load()
+        token = self._active_token()
         if not token or not token.get("access_token"):
             raise BridgeError("Connect Flax first with flax_connect")
         if token.get("expires_at", 0) < time.time() + 30:
@@ -695,18 +876,18 @@ class FlaxBridge:
 LOCAL_TOOLS = [
     {
         "name": "flax_connect",
-        "description": "Connect Codex to exactly one Flax site using a browser OAuth flow. Never request credentials or tokens in chat.",
+        "description": "Connect Codex to one Flax site using browser OAuth, or select a site that is already authorized. Never request credentials or tokens in chat.",
         "inputSchema": {"type": "object", "properties": {"siteUrl": {"type": "string", "description": "Exact site origin, for example https://example.com"}}, "required": ["siteUrl"]},
     },
     {
         "name": "flax_connection_status",
-        "description": "Show whether the local Flax OAuth connection is available and which site it is bound to.",
+        "description": "Show the active local Flax OAuth site and all sites authorized in this Codex client.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "flax_disconnect",
-        "description": "Remove the local Flax OAuth connection. This does not revoke access in Flax.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": "Remove one local Flax OAuth connection. With no siteUrl, remove the active site. This does not revoke access in Flax.",
+        "inputSchema": {"type": "object", "properties": {"siteUrl": {"type": "string", "description": "Optional exact site origin; defaults to the active site."}}, "additionalProperties": False},
     },
     {
         "name": "flax_audit_public_site",
@@ -722,6 +903,7 @@ LOCAL_TOOLS = [
                     "default": ["/"],
                 },
                 "includeIndexingFiles": {"type": "boolean", "default": True},
+                "siteUrl": {"type": "string", "description": "Optional authorized site origin; defaults to the active site."},
             },
             "additionalProperties": False,
         },
@@ -906,16 +1088,14 @@ class McpStdioServer:
                 if name == "flax_connect":
                     result = self.bridge.connect(arguments.get("siteUrl", ""))
                 elif name == "flax_connection_status":
-                    token = self.bridge.store.load() or {}
-                    result = {"connected": bool(token.get("access_token")), "siteUrl": token.get("site_url")}
+                    result = self.bridge.connection_status()
                 elif name == "flax_disconnect":
-                    self.bridge.store.clear()
-                    self.bridge.session_id = None
-                    result = {"message": "The local Flax connection was removed. Revoke it in Flax if needed."}
+                    result = self.bridge.disconnect(arguments.get("siteUrl"))
                 elif name == "flax_audit_public_site":
                     result = self.bridge.audit_public_site(
                         arguments.get("paths"),
                         arguments.get("includeIndexingFiles", True),
+                        arguments.get("siteUrl"),
                     )
                 elif name in BLOCKED_REMOTE_TOOLS:
                     raise BridgeError("Publishing is disabled in the local Flax plugin")

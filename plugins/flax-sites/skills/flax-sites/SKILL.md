@@ -10,8 +10,8 @@ Use the `flax-sites` MCP server for Flax website work.
 ## Connection workflow
 
 1. Require the exact website URL from the user.
-2. Call `flax_connect` with that URL when no connection exists. The bridge opens a one-time browser OAuth flow and stores the resulting token locally; never ask the user to paste credentials or tokens.
-3. Keep the connection bound to the site returned by that origin's `/.well-known/mcp.json`. Do not substitute the global endpoint or enumerate other sites.
+2. Call `flax_connect` with that URL. The bridge opens a one-time browser OAuth flow for that site when needed, stores the resulting token locally under that site origin, and selects an existing authorization without prompting again; never ask the user to paste credentials or tokens.
+3. Keep the active connection bound to the site returned by that origin's `/.well-known/mcp.json`. Multiple site origins may be authorized for the same Codex client, but each site must be selected explicitly with `flax_connect` before using its tools. Do not substitute the global endpoint or enumerate other sites.
 4. Read the current model and hash before proposing any change.
 5. Only inspect analytics or search-performance tools when the user explicitly asks for analytics.
 6. For public technical checks, call `flax_audit_public_site` with selected relative paths. Use its structured page, robots, and sitemap results instead of a general web reader or shell HTTP/parser commands.
