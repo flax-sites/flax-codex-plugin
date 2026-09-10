@@ -77,42 +77,22 @@ class FlaxMcpTests(unittest.TestCase):
         self.assertEqual(by_id[6]["result"], {})
         self.assertEqual(by_id[7]["result"]["content"][0]["type"], "text")
 
-    def test_mcp_manifest_uses_plugin_root_working_directory(self):
+    def test_mcp_manifest_uses_hosted_oauth_endpoint(self):
         manifest_path = Path(__file__).parents[1] / ".mcp.json"
         manifest = json.loads(manifest_path.read_text())
         server = manifest["mcpServers"]["flax-sites"]
-        self.assertEqual(server["cwd"], "./")
-        self.assertEqual(server["args"], ["./scripts/flax_mcp.py"])
+        self.assertEqual(server["type"], "http")
+        hosted_mcp_url = "https://agents.flaxsites.com/chatgpt/mcp"
+        self.assertEqual(server["url"], hosted_mcp_url)
+        self.assertEqual(server["oauth_resource"], hosted_mcp_url)
+        self.assertNotIn("command", server)
+        self.assertNotIn("cwd", server)
 
-    def test_mcp_manifest_starts_from_an_unrelated_working_directory(self):
+    def test_mcp_manifest_does_not_require_a_local_launcher(self):
         manifest_path = Path(__file__).parents[1] / ".mcp.json"
         manifest = json.loads(manifest_path.read_text())
         server = manifest["mcpServers"]["flax-sites"]
-        plugin_root = manifest_path.parent.resolve()
-        configured_cwd = str(plugin_root / server["cwd"])
-        request = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {},
-        }
-
-        with tempfile.TemporaryDirectory() as unrelated_cwd:
-            process = subprocess.run(
-                [server["command"], *server["args"]],
-                input=json.dumps(request) + "\n",
-                capture_output=True,
-                text=True,
-                # Codex resolves relative cwd against the installed plugin root;
-                # the task's unrelated working directory must not be used.
-                cwd=configured_cwd,
-                check=True,
-                timeout=15,
-            )
-
-        response = json.loads(process.stdout.splitlines()[0])
-        self.assertEqual(response["id"], 1)
-        self.assertTrue(Path(configured_cwd).is_dir())
+        self.assertEqual(set(server), {"type", "url", "oauth_resource"})
 
     def test_normalize_origin_discards_path_and_query(self):
         self.assertEqual(

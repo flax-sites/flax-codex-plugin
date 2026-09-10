@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "flax-sites": {
-      "command": "python3",
-      "args": ["./scripts/flax_mcp.py"],
-      "cwd": "./"
+      "type": "http",
+      "url": "https://agents.flaxsites.com/chatgpt/mcp",
+      "oauth_resource": "https://agents.flaxsites.com/chatgpt/mcp"
     }
   }
 }
