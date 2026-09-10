@@ -4,6 +4,20 @@ One plugin for ChatGPT and Codex: **Flax Sites**, identified as flax-sites@flax 
 
 The package uses plugins/flax-sites/.app.json to reference the registered Flax app. It has no bundled MCP connection or local bridge. The host manages OAuth and exposes the registered server's native tools.
 
+## Before installation: create a runtime connection
+
+An OpenAI Platform submission draft is not an installed ChatGPT developer connection. Do not copy an ID from platform.openai.com/plugins/edit into the package and assume it is callable.
+
+For private testing, enable Developer mode in ChatGPT's Security and login settings, open https://chatgpt.com/plugins, and create a connection to https://agents.flaxsites.com/chatgpt/mcp with OAuth. Complete the native connection flow. Use the actual registered connection ID in .app.json.
+
+Verify that Codex can resolve that exact ID and reports its runtime as enabled and callable **before** asking someone to restart and test. A successful anonymous MCP smoke check verifies the server only; it does not verify the plugin-to-account connection.
+
+Run `python3 scripts/check_plugin_connection.py` while signed into Codex to check the package's exact registration and committed runtime. This read-only check uses experimental Codex app-server APIs and fails if the registration is missing, disabled, or not callable. It does not authenticate or edit a site.
+
+The developer connection is private to its authorized testing account/workspace. For public distribution, use the approved published registration when it becomes available.
+
+The current mapping is the private **Flax Sites** ChatGPT developer connection (`asdk_app_6aa2e41fe0c48191988958111c70a202`). The Platform submission draft (`asdk_app_6a7b82bb6e508191b1b5d6d82fbf163a`) is a separate review artifact and must not be used as this account's runtime connection.
+
 ## Install in Codex from GitHub
 
 Run these commands:
