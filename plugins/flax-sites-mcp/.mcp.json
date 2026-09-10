@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "flax-sites-mcp": {
+      "type": "http",
+      "url": "https://agents.flaxsites.com/chatgpt/mcp",
+      "oauth_resource": "https://agents.flaxsites.com/chatgpt/mcp"
+    }
+  }
+}
