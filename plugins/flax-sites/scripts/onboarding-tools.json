@@ -1,0 +1,117 @@
+[
+  {
+    "name": "flax.sites.create",
+    "description": "Start the interactive Flax new-site flow. Use this for a new site, not for editing an existing connected site. It can start from a chosen whole-site starter (templateId) or let Flax choose by templateType, then collects the business name, service area, phone, email verification, and free Flax subdomain inside the app before publishing. Flax generates the site URL; do not ask the user to provide an exact URL in chat. MCP Apps-capable clients must render ui://flax/site-creation and stop this turn after calling the tool. The app returns the published site URL to the agent when the flow completes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "templateId": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Optional whole-site starter ID returned by browse_site_templates."
+        },
+        "templateType": {
+          "type": "string",
+          "enum": [
+            "services",
+            "shop",
+            "events",
+            "bookings"
+          ],
+          "description": "Optional site category used when Flax chooses a starter: services, shop, events, or bookings."
+        },
+        "businessName": {
+          "type": "string",
+          "maxLength": 160,
+          "description": "Optional business name to prefill in the creation app."
+        },
+        "city": {
+          "type": "string",
+          "maxLength": 160,
+          "description": "Optional city or service area to prefill."
+        },
+        "phone": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "Optional phone number to prefill."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 320,
+          "description": "Optional email address to prefill for sign-up."
+        }
+      },
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "flax_site_creation"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "awaiting_user_input",
+            "completed"
+          ]
+        },
+        "resourceUri": {
+          "type": "string"
+        },
+        "templateId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "templateType": {
+          "type": "string",
+          "enum": [
+            "services",
+            "shop",
+            "events",
+            "bookings"
+          ]
+        },
+        "site": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "agentInstruction": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "status",
+        "resourceUri",
+        "templateType"
+      ],
+      "additionalProperties": false
+    },
+    "securitySchemes": [
+      {
+        "type": "noauth"
+      }
+    ],
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": true,
+      "destructiveHint": false
+    },
+    "_meta": {
+      "ui": {
+        "resourceUri": "ui://flax/site-creation",
+        "visibility": [
+          "model",
+          "app"
+        ]
+      }
+    }
+  }
+]

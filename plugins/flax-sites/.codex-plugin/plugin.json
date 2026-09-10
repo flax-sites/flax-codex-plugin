@@ -1,6 +1,6 @@
 {
   "name": "flax-sites",
-  "version": "0.1.0+codex.20260814064836",
+  "version": "0.1.0+codex.20260907113000",
   "description": "Connect Codex to Flax Sites with browser OAuth and site-scoped MCP tools.",
   "author": {
     "name": "Flax"
@@ -40,5 +40,6 @@
       "Run an SEO programme for my site and give me regular updates."
     ]
   },
-  "mcpServers": "./.mcp.json"
+  "mcpServers": "./.mcp.json",
+  "apps": "./.app.json"
 }

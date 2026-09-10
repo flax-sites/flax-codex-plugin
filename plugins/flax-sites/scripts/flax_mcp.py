@@ -14,6 +14,7 @@ import http.server
 import json
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -35,11 +36,30 @@ TOKEN_ACCOUNT = "default"
 TOKEN_FILE = Path.home() / ".config" / "flax-sites" / "tokens.json"
 CALLBACK_TIMEOUT_SECONDS = 60
 KEYCHAIN_TIMEOUT_SECONDS = 5
+MCP_REQUEST_TIMEOUT_SECONDS = 60
 TOKEN_STORAGE_VERSION = 2
 MAX_AUDIT_PATHS = 12
 MAX_PUBLIC_RESPONSE_BYTES = 1024 * 1024
 MAX_SITEMAP_URLS = 500
-BLOCKED_REMOTE_TOOLS = {"flax_publish_change"}
+BLOCKED_REMOTE_TOOLS = {"flax_publish_change", "flax.drafts.publish_change"}
+PUBLIC_MCP_URL = "https://agents.flaxsites.com/mcp"
+PUBLIC_TOOL_NAMES = {"flax.sites.create"}
+REMOVED_ONBOARDING_TOOLS = {"flax.account.start_signup", "flax.sites.browse_templates", "flax_start_site_creation"}
+PUBLIC_RESOURCE_URIS = {"ui://flax/site-creation"}
+
+# Keep the stable local proxy names that Codex snapshots before OAuth, but use
+# the namespaced identifiers exposed by the site MCP server on the wire.
+REMOTE_TOOL_NAMES = {
+    "flax_list_sites": "flax.sites.list",
+    "flax_get_site_model": "flax.site.get_model",
+    "flax_get_site_insights": "flax.analytics.get_insights",
+    "flax_get_search_performance": "flax.analytics.get_search_performance",
+    "flax_upsert_article": "flax.content.upsert_article",
+    "flax_validate_model_update": "flax.drafts.validate_model_update",
+    "flax_propose_model_update": "flax.drafts.propose_model_update",
+    "flax_begin_image_upload": "flax.media.begin_upload",
+    "flax_get_change": "flax.drafts.get_change",
+}
 
 
 class BridgeError(RuntimeError):
@@ -100,8 +120,15 @@ def json_request(
     except urllib.error.HTTPError as error:
         raw = error.read()
         return error.code, dict(error.headers.items()), parse_json(raw)
+    except (TimeoutError, socket.timeout) as error:
+        raise BridgeError(
+            f"Could not reach {url}: request timed out after {timeout:g}s"
+        ) from error
     except urllib.error.URLError as error:
         raise BridgeError(f"Could not reach {url}: {error.reason}") from error
+    except OSError as error:
+        reason = str(error).strip() or "the connection was closed"
+        raise BridgeError(f"Could not reach {url}: {reason}") from error
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -332,6 +359,64 @@ def as_tool_result(value: Any) -> dict[str, Any]:
                 "text": json.dumps(value, separators=(",", ":"), ensure_ascii=False),
             }
         ]
+    }
+
+
+def public_rpc(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Access only anonymous onboarding; never send a site's authorization."""
+    params = params or {}
+    allowed = method in {"tools/list", "resources/list"}
+    allowed |= method == "tools/call" and params.get("name") in PUBLIC_TOOL_NAMES
+    allowed |= method == "resources/read" and params.get("uri") in PUBLIC_RESOURCE_URIS
+    if not allowed:
+        raise BridgeError("This request requires a site-scoped connection")
+    for attempt in range(2):
+        try:
+            status, _, body = json_request(
+                PUBLIC_MCP_URL, "POST",
+                {"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                timeout=15, follow_redirects=False,
+            )
+            break
+        except BridgeError as error:
+            # A TLS handshake failure occurs before the HTTP request is sent.
+            if attempt or "EOF occurred in violation of protocol" not in str(error):
+                raise
+    if not 200 <= status < 300 or not isinstance(body, dict):
+        raise BridgeError("Flax anonymous onboarding is unavailable")
+    if isinstance(body.get("error"), dict):
+        raise BridgeError(str(body["error"].get("message", "Onboarding request failed")))
+    return body
+
+
+def remote_tool_name(name: str) -> str:
+    return REMOTE_TOOL_NAMES.get(name, name)
+
+
+def project_model_hash_result(value: Any) -> Any:
+    """Project the public model-read response onto the legacy hash proxy."""
+    if not isinstance(value, dict):
+        return value
+    result = value.get("result")
+    if not isinstance(result, dict) or result.get("isError"):
+        return value
+    structured = result.get("structuredContent")
+    digest = structured.get("hash") if isinstance(structured, dict) else None
+    if not isinstance(digest, str) or not digest:
+        return value
+    return {
+        **value,
+        "result": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {"hash": digest}, separators=(",", ":")
+                    ),
+                }
+            ],
+            "structuredContent": {"hash": digest},
+        },
     }
 
 
@@ -855,6 +940,7 @@ class FlaxBridge:
             method="POST",
             body={"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}},
             headers=headers,
+            timeout=MCP_REQUEST_TIMEOUT_SECONDS,
         )
         if status == 401:
             token = self.refresh(token)
@@ -863,6 +949,7 @@ class FlaxBridge:
                 token["mcp_url"], method="POST",
                 body={"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}},
                 headers=headers,
+                timeout=MCP_REQUEST_TIMEOUT_SECONDS,
             )
         if status < 200 or status >= 300:
             raise BridgeError(f"Flax MCP request failed with HTTP {status}")
@@ -876,7 +963,7 @@ class FlaxBridge:
 LOCAL_TOOLS = [
     {
         "name": "flax_connect",
-        "description": "Connect Codex to one Flax site using browser OAuth, or select a site that is already authorized. Never request credentials or tokens in chat.",
+        "description": "Connect Codex to an existing Flax site using browser OAuth, or select a site that is already authorized. This tool requires the site's exact URL and must not be used when the user wants to create a new site. Never request credentials or tokens in chat.",
         "inputSchema": {"type": "object", "properties": {"siteUrl": {"type": "string", "description": "Exact site origin, for example https://example.com"}}, "required": ["siteUrl"]},
     },
     {
@@ -995,7 +1082,7 @@ PROXIED_REMOTE_TOOLS = [
     },
     {
         "name": "flax_begin_image_upload",
-        "description": "Authorize one direct WebP upload for an agent-local image.",
+        "description": "Authorize one direct WebP upload for an image supplied by the agent.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1031,8 +1118,15 @@ class McpStdioServer:
 
     def tools(self) -> list[dict[str, Any]]:
         tools_by_name = {
-            tool["name"]: tool for tool in [*LOCAL_TOOLS, *PROXIED_REMOTE_TOOLS]
+            tool["name"]: tool for tool in (
+                [*LOCAL_TOOLS, *PROXIED_REMOTE_TOOLS] if self.bridge.connected()
+                else [tool for tool in LOCAL_TOOLS if tool["name"] == "flax_connect"]
+            )
         }
+        public_tools = json.loads(Path(__file__).with_name("onboarding-tools.json").read_text())
+        for tool in public_tools:
+            if tool.get("name") in PUBLIC_TOOL_NAMES:
+                tools_by_name[tool["name"]] = tool
         if self.bridge.connected():
             try:
                 remote = self.bridge.rpc("tools/list")
@@ -1049,12 +1143,37 @@ class McpStdioServer:
                     if (
                         isinstance(tool, dict)
                         and isinstance(tool.get("name"), str)
-                        and tool["name"] not in BLOCKED_REMOTE_TOOLS
+                        and tool["name"] not in BLOCKED_REMOTE_TOOLS | REMOVED_ONBOARDING_TOOLS
                     ):
                         tools_by_name[tool["name"]] = tool
-            except BridgeError as error:
+            except (BridgeError, TimeoutError, OSError) as error:
                 eprint(str(error))
         return list(tools_by_name.values())
+
+    def forward_remote_request(
+        self,
+        request_id: Any,
+        method: str,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            if (method == "resources/read" and (params or {}).get("uri") in PUBLIC_RESOURCE_URIS) or (method == "resources/list" and not self.bridge.connected()):
+                remote = public_rpc(method, params)
+            else:
+                remote = self.bridge.rpc(method, params or {})
+            if isinstance(remote, dict) and isinstance(remote.get("error"), dict):
+                self.send({"jsonrpc": "2.0", "id": request_id, "error": remote["error"]})
+                return
+            result = remote.get("result", remote) if isinstance(remote, dict) else remote
+            self.send({"jsonrpc": "2.0", "id": request_id, "result": result})
+        except (BridgeError, TimeoutError, OSError) as error:
+            self.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32000, "message": str(error)},
+                }
+            )
 
     def handle(self, message: dict[str, Any]) -> None:
         method = message.get("method")
@@ -1063,13 +1182,20 @@ class McpStdioServer:
             return
         if method == "initialize":
             self.initialized = True
-            self.send({"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": True}, "resources": {}, "prompts": {}}, "serverInfo": {"name": "flax-sites", "version": PLUGIN_VERSION}}})
+            self.send({"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": True}, "resources": {}, "prompts": {}, "extensions": {"io.modelcontextprotocol/ui": {"mimeTypes": ["text/html;profile=mcp-app"]}}}, "serverInfo": {"name": "flax-sites", "version": PLUGIN_VERSION}}})
             return
         if method == "tools/list":
             self.send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": self.tools()}})
             return
         if method == "resources/list":
-            self.send({"jsonrpc": "2.0", "id": request_id, "result": {"resources": []}})
+            if not self.bridge.connected():
+                resources = json.loads(Path(__file__).with_name("onboarding-resources.json").read_text())
+                self.send({"jsonrpc": "2.0", "id": request_id, "result": {"resources": resources}})
+            else:
+                self.forward_remote_request(request_id, method, message.get("params"))
+            return
+        if method == "resources/read":
+            self.forward_remote_request(request_id, method, message.get("params"))
             return
         if method == "resources/templates/list":
             self.send({"jsonrpc": "2.0", "id": request_id, "result": {"resourceTemplates": []}})
@@ -1085,7 +1211,11 @@ class McpStdioServer:
             name = params.get("name")
             arguments = params.get("arguments") or {}
             try:
-                if name == "flax_connect":
+                if name in REMOVED_ONBOARDING_TOOLS:
+                    raise BridgeError("Use flax.sites.create for the combined new-site flow")
+                elif name in PUBLIC_TOOL_NAMES:
+                    result = public_rpc("tools/call", {"name": name, "arguments": arguments})
+                elif name == "flax_connect":
                     result = self.bridge.connect(arguments.get("siteUrl", ""))
                 elif name == "flax_connection_status":
                     result = self.bridge.connection_status()
@@ -1100,7 +1230,15 @@ class McpStdioServer:
                 elif name in BLOCKED_REMOTE_TOOLS:
                     raise BridgeError("Publishing is disabled in the local Flax plugin")
                 else:
-                    result = self.bridge.rpc("tools/call", {"name": name, "arguments": arguments})
+                    remote_name = remote_tool_name(name)
+                    if name == "flax_get_model_hash":
+                        remote_name = REMOTE_TOOL_NAMES["flax_get_site_model"]
+                        arguments = {**arguments, "view": "compact"}
+                    result = self.bridge.rpc(
+                        "tools/call", {"name": remote_name, "arguments": arguments}
+                    )
+                    if name == "flax_get_model_hash":
+                        result = project_model_hash_result(result)
                 if isinstance(result, dict) and "error" in result:
                     self.send({"jsonrpc": "2.0", "id": request_id, "error": result["error"]})
                 else:
@@ -1114,7 +1252,7 @@ class McpStdioServer:
                     )
                 if name == "flax_connect":
                     self.send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed", "params": {}})
-            except BridgeError as error:
+            except (BridgeError, TimeoutError, OSError) as error:
                 self.send({"jsonrpc": "2.0", "id": request_id, "result": {"isError": True, "content": [{"type": "text", "text": str(error)}]}})
             return
         if request_id is not None:

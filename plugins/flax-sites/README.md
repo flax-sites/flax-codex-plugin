@@ -17,8 +17,9 @@ The bundled `.mcp.json` starts:
 python3 ./scripts/flax_mcp.py
 ```
 
-The MCP manifest sets its working directory to the plugin root, so this
-relative launcher works even when Codex starts it from another directory.
+The MCP manifest sets `cwd` to `./`, which Codex resolves against the installed
+plugin directory. The launcher path is relative to that directory. Do not use
+`${PLUGIN_ROOT}` in `cwd`: this Codex build treats it as a literal directory name.
 
 ## Use
 
@@ -35,6 +36,12 @@ client. Calling `flax_connect` for a site that is already authorized selects it
 without opening another browser flow. `flax_connection_status` lists all saved
 sites, and `flax_disconnect` removes only the active site unless a `siteUrl` is
 provided.
+
+For a new site, Codex calls only `flax.sites.create`. Its embedded app handles
+template selection, signup, business details and initial deployment together,
+then returns the published URL. This is the only anonymous onboarding tool.
+The separate signup, template browser and browser-launch shortcuts are removed.
+Site-management tools require an existing authorized site connection.
 
 The local `flax_audit_public_site` tool performs bounded read-only checks of
 HTML metadata, `robots.txt`, and `sitemap.xml` on that exact connected origin.

@@ -3,7 +3,7 @@
     "flax-sites": {
       "command": "python3",
       "args": ["./scripts/flax_mcp.py"],
-      "cwd": "."
+      "cwd": "./"
     }
   }
 }

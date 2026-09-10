@@ -11,7 +11,10 @@ from flax_mcp import (
     BridgeError,
     FlaxBridge,
     McpStdioServer,
+    PUBLIC_MCP_URL,
+    public_rpc,
     TokenStore,
+    json_request,
     merge_query_params,
     metadata_candidates,
     normalize_audit_path,
@@ -42,7 +45,15 @@ class FlaxMcpTests(unittest.TestCase):
             },
         ]
         process = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("flax_mcp.py"))],
+            [sys.executable, "-c", (
+                "import sys,tempfile; from pathlib import Path; "
+                f"sys.path.insert(0, {str(Path(__file__).parent)!r}); "
+                "from flax_mcp import McpStdioServer,FlaxBridge,TokenStore; "
+                "sandbox=tempfile.TemporaryDirectory(); "
+                "server=McpStdioServer(); "
+                "server.bridge=FlaxBridge(TokenStore(Path(sandbox.name)/'tokens.json')); "
+                "server.run()"
+            )],
             input="".join(json.dumps(request) + "\n" for request in requests),
             capture_output=True,
             text=True,
@@ -53,21 +64,55 @@ class FlaxMcpTests(unittest.TestCase):
         by_id = {response["id"]: response for response in responses}
         tool_names = [tool["name"] for tool in by_id[2]["result"]["tools"]]
         self.assertIn("flax_connect", tool_names)
-        self.assertIn("flax_audit_public_site", tool_names)
-        self.assertIn("flax_get_site_model", tool_names)
-        self.assertIn("flax_get_model_hash", tool_names)
-        self.assertEqual(by_id[3]["result"], {"resources": []})
+        self.assertIn("flax.sites.create", tool_names)
+        self.assertNotIn("flax.account.start_signup", tool_names)
+        self.assertNotIn("flax.sites.browse_templates", tool_names)
+        self.assertNotIn("flax_start_site_creation", tool_names)
+        self.assertNotIn("flax_audit_public_site", tool_names)
+        self.assertNotIn("flax_get_site_model", tool_names)
+        self.assertNotIn("flax_get_model_hash", tool_names)
+        self.assertIsInstance(by_id[3]["result"].get("resources"), list)
         self.assertEqual(by_id[4]["result"], {"resourceTemplates": []})
         self.assertEqual(by_id[5]["result"], {"prompts": []})
         self.assertEqual(by_id[6]["result"], {})
         self.assertEqual(by_id[7]["result"]["content"][0]["type"], "text")
 
-    def test_mcp_manifest_runs_relative_launcher_from_plugin_root(self):
+    def test_mcp_manifest_uses_plugin_root_working_directory(self):
         manifest_path = Path(__file__).parents[1] / ".mcp.json"
         manifest = json.loads(manifest_path.read_text())
         server = manifest["mcpServers"]["flax-sites"]
-        self.assertEqual(server["cwd"], ".")
+        self.assertEqual(server["cwd"], "./")
         self.assertEqual(server["args"], ["./scripts/flax_mcp.py"])
+
+    def test_mcp_manifest_starts_from_an_unrelated_working_directory(self):
+        manifest_path = Path(__file__).parents[1] / ".mcp.json"
+        manifest = json.loads(manifest_path.read_text())
+        server = manifest["mcpServers"]["flax-sites"]
+        plugin_root = manifest_path.parent.resolve()
+        configured_cwd = str(plugin_root / server["cwd"])
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {},
+        }
+
+        with tempfile.TemporaryDirectory() as unrelated_cwd:
+            process = subprocess.run(
+                [server["command"], *server["args"]],
+                input=json.dumps(request) + "\n",
+                capture_output=True,
+                text=True,
+                # Codex resolves relative cwd against the installed plugin root;
+                # the task's unrelated working directory must not be used.
+                cwd=configured_cwd,
+                check=True,
+                timeout=15,
+            )
+
+        response = json.loads(process.stdout.splitlines()[0])
+        self.assertEqual(response["id"], 1)
+        self.assertTrue(Path(configured_cwd).is_dir())
 
     def test_normalize_origin_discards_path_and_query(self):
         self.assertEqual(
@@ -78,6 +123,53 @@ class FlaxMcpTests(unittest.TestCase):
     def test_normalize_origin_rejects_credentials(self):
         with self.assertRaises(Exception):
             normalize_origin("https://user:pass@example.com")
+
+    def test_json_request_converts_timeout_into_a_recoverable_bridge_error(self):
+        opener = mock.Mock()
+        opener.open.side_effect = TimeoutError("timed out")
+        with mock.patch(
+            "flax_mcp.urllib.request.build_opener", return_value=opener
+        ):
+            with self.assertRaisesRegex(BridgeError, "request timed out"):
+                json_request("https://example.com", timeout=7)
+
+        opener.open.assert_called_once()
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 7)
+
+    def test_json_request_converts_closed_connection_into_a_bridge_error(self):
+        opener = mock.Mock()
+        opener.open.side_effect = ConnectionResetError()
+        with mock.patch(
+            "flax_mcp.urllib.request.build_opener", return_value=opener
+        ):
+            with self.assertRaisesRegex(BridgeError, "connection was closed"):
+                json_request("https://example.com")
+
+    def test_mcp_tool_timeout_does_not_kill_the_stdio_bridge(self):
+        class Bridge:
+            def rpc(self, _method, _params):
+                raise TimeoutError("request timed out")
+
+        server = McpStdioServer()
+        server.bridge = Bridge()
+        messages = []
+        server.send = messages.append
+        server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "flax_get_site_model",
+                    "arguments": {},
+                },
+            }
+        )
+        server.handle({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+
+        self.assertTrue(messages[0]["result"]["isError"])
+        self.assertIn("timed out", messages[0]["result"]["content"][0]["text"])
+        self.assertEqual(messages[1]["result"], {})
 
     def test_merge_query_params_preserves_existing_site_context(self):
         authorization_url = merge_query_params(
@@ -163,7 +255,7 @@ class FlaxMcpTests(unittest.TestCase):
             self.assertEqual(store.load(), value)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
-    def test_proxy_tools_are_declared_before_authentication(self):
+    def test_only_creation_and_existing_site_connection_are_anonymous(self):
         class Bridge:
             def connected(self):
                 return False
@@ -171,10 +263,7 @@ class FlaxMcpTests(unittest.TestCase):
         server = McpStdioServer()
         server.bridge = Bridge()
         names = [tool["name"] for tool in server.tools()]
-        self.assertIn("flax_connect", names)
-        self.assertIn("flax_audit_public_site", names)
-        self.assertIn("flax_get_site_model", names)
-        self.assertIn("flax_get_model_hash", names)
+        self.assertEqual(set(names), {"flax_connect", "flax.sites.create"})
 
     def test_audit_paths_must_stay_on_connected_origin(self):
         self.assertEqual(normalize_audit_path("/services?area=salford"), "/services?area=salford")
@@ -268,8 +357,13 @@ class FlaxMcpTests(unittest.TestCase):
         self.assertEqual(payload["siteUrl"], "https://site.example")
         self.assertEqual(server.bridge.call, (["/services"], False, None))
 
-    def test_resource_and_prompt_probes_return_empty_lists(self):
+    def test_resource_probes_include_anonymous_onboarding(self):
+        class Bridge:
+            def connected(self):
+                return False
+
         server = McpStdioServer()
+        server.bridge = Bridge()
         messages = []
         server.send = messages.append
         for request_id, method in enumerate(
@@ -279,10 +373,72 @@ class FlaxMcpTests(unittest.TestCase):
             server.handle(
                 {"jsonrpc": "2.0", "id": request_id, "method": method, "params": {}}
             )
-        self.assertEqual(messages[0]["result"], {"resources": []})
+        self.assertEqual({resource["uri"] for resource in messages[0]["result"]["resources"]}, {"ui://flax/site-creation"})
         self.assertEqual(messages[1]["result"], {"resourceTemplates": []})
         self.assertEqual(messages[2]["result"], {"prompts": []})
         self.assertEqual(messages[3]["result"], {})
+
+    def test_authenticated_mcp_app_resources_are_forwarded_to_site(self):
+        class Bridge:
+            def connected(self):
+                return True
+
+            def rpc(self, method, params):
+                self.call = (method, params)
+                if method == "resources/list":
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "resources": [
+                                {
+                                    "uri": "ui://flax/section-template-picker",
+                                    "mimeType": "text/html;profile=mcp-app",
+                                }
+                            ]
+                        },
+                    }
+                return {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {
+                        "contents": [
+                            {
+                                "uri": "ui://flax/section-template-picker",
+                                "mimeType": "text/html;profile=mcp-app",
+                                "text": "<!doctype html>",
+                            }
+                        ]
+                    },
+                }
+
+        server = McpStdioServer()
+        server.bridge = Bridge()
+        messages = []
+        server.send = messages.append
+        server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/list",
+                "params": {},
+            }
+        )
+        server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": {"uri": "ui://flax/section-template-picker"},
+            }
+        )
+
+        self.assertEqual(messages[0]["result"]["resources"][0]["uri"], "ui://flax/section-template-picker")
+        self.assertEqual(messages[1]["result"]["contents"][0]["text"], "<!doctype html>")
+        self.assertEqual(
+            server.bridge.call,
+            ("resources/read", {"uri": "ui://flax/section-template-picker"}),
+        )
 
     def test_connect_reuses_a_valid_same_site_connection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -539,6 +695,27 @@ class FlaxMcpTests(unittest.TestCase):
                 "connectedSites": ["https://example.com"],
             },
         )
+
+    def test_onboarding_is_anonymous_and_preserves_app_result(self):
+        server = McpStdioServer()
+        server.bridge = mock.Mock()
+        messages = []
+        server.send = messages.append
+        result = {"content": [], "structuredContent": {"status": "awaiting_user_input"}, "_meta": {"ui": {"resourceUri": "ui://flax/site-creation"}}}
+        with mock.patch("flax_mcp.json_request", return_value=(200, {}, {"result": result})) as request:
+            server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "flax.sites.create", "arguments": {}}})
+        self.assertEqual(messages[0]["result"], result)
+        server.bridge.rpc.assert_not_called()
+        self.assertEqual(request.call_args.args[0], PUBLIC_MCP_URL)
+        self.assertNotIn("headers", request.call_args.kwargs)
+
+    def test_public_transport_rejects_site_tools(self):
+        with mock.patch("flax_mcp.json_request") as request:
+            with self.assertRaises(BridgeError):
+                public_rpc("tools/call", {"name": "flax.site.get_model"})
+            with self.assertRaises(BridgeError):
+                public_rpc("resources/read", {"uri": "ui://flax/branding-dialog"})
+        request.assert_not_called()
 
     def test_successful_connect_returns_tool_result_before_discovery_notification(self):
         class Bridge:
