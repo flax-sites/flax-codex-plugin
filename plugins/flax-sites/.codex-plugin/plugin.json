@@ -1,6 +1,6 @@
 {
   "name": "flax-sites",
-  "version": "0.1.0+codex.20260910171142",
+  "version": "0.1.0+codex.20260910173133",
   "description": "Manage Flax websites in ChatGPT and Codex using the registered Flax app and native OAuth.",
   "author": {
     "name": "Flax"
