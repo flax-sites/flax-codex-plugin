@@ -1,7 +1,7 @@
 {
   "name": "flax-sites",
-  "version": "0.1.0+codex.20260910104455",
-  "description": "Connect Codex to Flax Sites with browser OAuth and site-scoped MCP tools.",
+  "version": "0.1.0+codex.20260910104701",
+  "description": "Connect Codex to Flax Sites through hosted OAuth MCP tools and prepare owner-approved drafts.",
   "author": {
     "name": "Flax"
   },
@@ -18,7 +18,7 @@
   "interface": {
     "displayName": "Flax Sites",
     "shortDescription": "Connect Codex to your Flax website.",
-    "longDescription": "Use a browser-based Flax OAuth connection to inspect one named site and prepare owner-approved drafts through its site-scoped MCP server.",
+    "longDescription": "Use Flax's hosted OAuth MCP server to find an authorized site, inspect its model, and prepare owner-approved drafts without launching a local bridge.",
     "developerName": "Flax",
     "category": "Productivity",
     "capabilities": [
