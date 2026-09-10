@@ -29,12 +29,14 @@ initialized = rpc("initialize", {
     "clientInfo": {"name": "flax-interface-check", "version": "1.0"},
 })
 assert "flax.sites.list" in initialized["instructions"], initialized
+assert "serviceLocations.locations" in initialized["instructions"], initialized
 tools = rpc("tools/list")["tools"]
 by_name = {tool["name"]: tool for tool in tools}
 required = {
     "flax.sites.list", "flax.site.get_model", "flax.sites.create",
     "flax.drafts.validate_model_update", "flax.drafts.propose_model_update",
     "flax.drafts.get_change",
+    "flax.site.get_snapshot", "flax.content.get_type",
 }
 assert required <= by_name.keys(), "Missing tools: " + str(required - by_name.keys())
 assert "flax.drafts.publish_change" not in by_name
