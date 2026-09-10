@@ -1,38 +1,29 @@
 ---
 name: flax-sites
-description: Connect Codex to Flax through its hosted OAuth MCP server, inspect a named site, and prepare safe previewable drafts.
+description: Use the registered Flax Sites app to inspect an existing Flax website and prepare previewable updates, or create a new site.
 ---
 
-# Flax Sites in Codex
+# Flax Sites
 
-Use the `flax-sites` MCP server for Flax website work.
+Use the native tools supplied by this plugin's registered Flax app. ChatGPT and Codex own the connection and OAuth flow.
 
-## Connection workflow
+## Existing website
 
-1. If the user names an existing site, use `flax_list_sites` first and match the user's exact origin against the returned site URLs. Pass the matching returned `siteId` to subsequent site tools. If the site is not returned, explain that the user must authorize or connect that site in Flax; never substitute another site. Never ask the user to paste credentials or tokens.
-2. For any new site, call only `flax.sites.create` with the business category if known (for example `templateType: "services"`). It opens one embedded app for template selection, business details, signup, email verification and initial deployment. Stop the turn after opening it and let the user finish in that app. The app sends the published site URL back to this task. Do not call a separate template picker or account signup tool, open an agency signup page, or ask the user to supply the new site's URL. Once the app returns the created URL, call `flax_list_sites` and use the exact returned `siteId` for any follow-up site management. This combined tool is the only anonymous Flax workflow.
-3. Keep every operation bound to the exact `siteId` returned by `flax_list_sites`. Do not substitute another site, infer IDs from URLs, or call tools for a different site. The anonymous onboarding flow uses the same hosted MCP server without site credentials.
-4. Read the current model and hash before proposing any change.
-5. Only inspect analytics or search-performance tools when the user explicitly asks for analytics.
-6. For public technical checks, call `flax_audit_public_site` with selected relative paths. Use its structured page, robots, and sitemap results instead of a general web reader or shell HTTP/parser commands.
+1. Call the native tool corresponding to flax.sites.list. Match the user's exact origin against the returned URLs; use the matching site's returned id as siteId. Never invent an ID or substitute another site.
+2. If the tool requests authentication, let the host show its native Connect/Sign in flow. After the user connects, retry the read. If the requested site is absent, explain that the connected Flax account needs access to that site.
+3. Read flax.site.get_model and its current hash. Use the returned model and advertised schema; preserve unrelated fields.
+4. For a clear requested correction, such as changing insurance cover to £5 million, validate with flax.drafts.validate_model_update, then prepare the draft with flax.drafts.propose_model_update. The user's explicit edit request authorizes this preview draft; do not require them to approve the same edit again.
+5. Report what changed and return the preview URL and change ID from the result. The owner reviews and publishes in Flax. Never publish or deploy from this plugin.
+6. Re-read and revalidate if the model hash is stale. Inspect analytics only when requested.
 
-Do not launch `scripts/flax_mcp.py`, use `exec` as an MCP fallback, or render MCP tool responses as plain JSON. If the native `flax-sites` tools are unavailable, stop and report that the plugin connection needs to be restarted or repaired.
+Tool names may have a host namespace or normalized punctuation. Select the exposed tool with the corresponding purpose and schema. Do not invent tool arguments. Use additional tools only if they are actually advertised by the connected app.
 
-## Change workflow
+## New website
 
-- Report findings before proposing edits.
-- Validate proposed model operations against the current model and hash.
-- Create drafts/previews only after the user confirms the focused plan.
-- Never call a publish/deploy tool. The owner publishes in Flax.
-- Treat a stale-model error as a reason to re-read the model and revalidate.
+Call flax.sites.create only when the user wants a new website. Its embedded app handles starter selection, business details, sign-up and initial publishing. Stop after opening that app and let the user finish. Use the returned site URL for subsequent management.
 
-## Recurring updates
+## Missing connection
 
-When the user explicitly asks for regular updates, use a task-attached heartbeat
-automation. On creation, omit `id`, use uppercase `ACTIVE`, set `kind` to
-`heartbeat`, set the current task as `targetThreadId`, set `destination` to
-`local`, and express the schedule only with `rrule`—do not send a fixed start
-timestamp. Prefer updating an existing matching automation over creating a
-duplicate, and verify creation succeeded before reporting that it is scheduled.
+If Flax tools are missing, say: “Flax Sites is installed, but its registered app tools are unavailable. Connect Flax Sites in the host's plugin settings, then start a new task/chat.”
 
-Codex handles OAuth and hosted MCP transport. Do not recreate those mechanics in chat or expose authorization URLs as reusable links.
+Stop there. Do not use shell commands, Python bridges, manual HTTP/JSON-RPC, site discovery endpoints, loopback servers, or hand-built OAuth links as a fallback. Never ask for passwords, authorization codes or tokens in chat. Do not use the separate OpenAI Sites plugin for Flax websites.
