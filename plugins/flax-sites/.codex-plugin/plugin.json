@@ -1,7 +1,7 @@
 {
   "name": "flax-sites",
-  "version": "0.1.0+codex.20260910104701",
-  "description": "Connect Codex to Flax Sites through hosted OAuth MCP tools and prepare owner-approved drafts.",
+  "version": "0.1.0+codex.20260910164947",
+  "description": "Manage Flax websites in ChatGPT and Codex using the registered Flax app and native OAuth.",
   "author": {
     "name": "Flax"
   },
@@ -17,8 +17,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Flax Sites",
-    "shortDescription": "Connect Codex to your Flax website.",
-    "longDescription": "Use Flax's hosted OAuth MCP server to find an authorized site, inspect its model, and prepare owner-approved drafts without launching a local bridge.",
+    "shortDescription": "Review and update your Flax website.",
+    "longDescription": "Connect your Flax account, inspect an existing site, and prepare previewable drafts for the owner to publish. Native ChatGPT and Codex tools handle authentication.",
     "developerName": "Flax",
     "category": "Productivity",
     "capabilities": [
@@ -40,6 +40,5 @@
       "Run an SEO programme for my site and give me regular updates."
     ]
   },
-  "mcpServers": "./.mcp.json",
   "apps": "./.app.json"
 }
